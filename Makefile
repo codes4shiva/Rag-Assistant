@@ -1,0 +1,44 @@
+PYTHON ?= python3
+
+.PHONY: install test api ui db-upgrade db-revision docker-up docker-config smoke smoke-e2e benchmark docker-down lint
+
+install:
+	cd api && $(PYTHON) -m pip install -e .[dev]
+
+test:
+	PYTHONPATH=api/src $(PYTHON) -m pytest
+
+api:
+	cd api && PYTHONPATH=src uvicorn rag_assistant_api.main:app --reload --host 0.0.0.0 --port 8000
+
+ui:
+	cd ui && $(PYTHON) -m http.server 3000
+
+db-upgrade:
+	cd api && PYTHONPATH=src alembic upgrade head
+
+db-revision:
+	cd api && PYTHONPATH=src alembic revision --autogenerate -m "$(m)"
+
+docker-up:
+	cp -n .env.example .env || true
+	docker compose up --build
+
+docker-config:
+	docker compose config
+
+smoke:
+	curl -f http://localhost:8000/health/live
+	curl -f http://localhost:8000/health/ready
+
+smoke-e2e:
+	scripts/smoke_docker.sh
+
+benchmark:
+	PYTHONPATH=api/src $(PYTHON) scripts/run_benchmark.py
+
+docker-down:
+	docker compose down
+
+lint:
+	cd api && $(PYTHON) -m compileall src

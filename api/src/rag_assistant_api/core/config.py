@@ -1,0 +1,138 @@
+from __future__ import annotations
+
+from pathlib import Path
+
+from pydantic import Field, field_validator, model_validator
+from pydantic_settings import BaseSettings, SettingsConfigDict
+
+
+class Settings(BaseSettings):
+    model_config = SettingsConfigDict(env_file=".env", extra="ignore", case_sensitive=False)
+
+    app_env: str = "development"
+    log_level: str = "INFO"
+    api_host: str = "0.0.0.0"
+    api_port: int = 8000
+    api_cors_origins: list[str] = Field(default_factory=lambda: ["http://localhost:3000"])
+    api_auth_token: str = ""
+    api_docs_enabled: bool = True
+    api_query_rate_limit_per_minute: int = 30
+    api_url_ingest_rate_limit_per_minute: int = 10
+    api_rate_limit_window_seconds: int = 60
+    database_url: str | None = None
+    worker_poll_seconds: float = 2.0
+    job_lease_seconds: int = 300
+
+    qdrant_url: str = "http://localhost:6333"
+    qdrant_collection: str = "rag_assistant"
+    qdrant_vector_size: int = 384
+    qdrant_location: str | None = None
+
+    top_k: int = 5
+    relevance_min_lexical_score: float = 0.12
+    relevance_min_dense_score: float = 0.40
+    relevance_min_final_score: float = 0.01
+    relevance_min_meaningful_terms: int = 2
+    default_chunker_type: str = "recursive"
+    default_chunk_size: int = 700
+    default_chunk_overlap: int = 120
+    max_chunk_size: int = 1400
+    max_upload_file_bytes: int = 25 * 1024 * 1024
+    max_url_bytes: int = 5 * 1024 * 1024
+    max_sitemap_urls: int = 100
+    accepted_file_extensions: list[str] = Field(default_factory=lambda: [".pdf", ".docx", ".md", ".markdown"])
+    allow_private_urls: bool = False
+    url_allowed_domains: list[str] = Field(default_factory=list)
+    url_blocked_domains: list[str] = Field(default_factory=list)
+
+    embed_provider: str = "mock"
+    embed_model: str = "sentence-transformers/all-MiniLM-L6-v2"
+
+    llm_provider: str = "mock"
+    llm_model: str = "gpt-4o-mini"
+    reranker_provider: str = "mock"
+    reranker_model: str = "gpt-4o-mini"
+    openai_api_key: str = ""
+    ollama_base_url: str = "http://localhost:11434"
+    ollama_model: str = "qwen2.5:7b"
+
+    eval_dataset_dir: Path | None = None
+    eval_faithfulness_use_llm: bool = False
+
+    @field_validator("api_cors_origins", mode="before")
+    @classmethod
+    def split_origins(cls, value: str | list[str]) -> list[str]:
+        if isinstance(value, str):
+            return [item.strip() for item in value.split(",") if item.strip()]
+        return value
+
+    @field_validator("accepted_file_extensions", "url_allowed_domains", "url_blocked_domains", mode="before")
+    @classmethod
+    def split_csv(cls, value: str | list[str]) -> list[str]:
+        if isinstance(value, str):
+            return [item.strip() for item in value.split(",") if item.strip()]
+        return value
+
+    @model_validator(mode="after")
+    def validate_runtime_settings(self):
+        self.embed_provider = self.embed_provider.lower()
+        self.llm_provider = self.llm_provider.lower()
+        self.reranker_provider = self.reranker_provider.lower()
+        self.app_env = self.app_env.lower()
+        if self.qdrant_vector_size <= 0:
+            raise ValueError("QDRANT_VECTOR_SIZE must be positive.")
+        if self.top_k <= 0:
+            raise ValueError("TOP_K must be positive.")
+        if self.api_query_rate_limit_per_minute < 0:
+            raise ValueError("API_QUERY_RATE_LIMIT_PER_MINUTE must be non-negative.")
+        if self.api_url_ingest_rate_limit_per_minute < 0:
+            raise ValueError("API_URL_INGEST_RATE_LIMIT_PER_MINUTE must be non-negative.")
+        if self.api_rate_limit_window_seconds <= 0:
+            raise ValueError("API_RATE_LIMIT_WINDOW_SECONDS must be positive.")
+        if not 0 <= self.relevance_min_lexical_score <= 1:
+            raise ValueError("RELEVANCE_MIN_LEXICAL_SCORE must be between 0 and 1.")
+        if not 0 <= self.relevance_min_dense_score <= 1:
+            raise ValueError("RELEVANCE_MIN_DENSE_SCORE must be between 0 and 1.")
+        if not 0 <= self.relevance_min_final_score <= 1:
+            raise ValueError("RELEVANCE_MIN_FINAL_SCORE must be between 0 and 1.")
+        if self.relevance_min_meaningful_terms < 0:
+            raise ValueError("RELEVANCE_MIN_MEANINGFUL_TERMS must be non-negative.")
+        if self.default_chunk_overlap >= self.default_chunk_size:
+            raise ValueError("DEFAULT_CHUNK_OVERLAP must be smaller than DEFAULT_CHUNK_SIZE.")
+        if self.app_env == "production" and "mock" in {self.embed_provider, self.llm_provider}:
+            raise ValueError("Mock providers are not allowed when APP_ENV=production.")
+        if self.reranker_provider not in {"none", "mock", "openai"}:
+            raise ValueError("RERANKER_PROVIDER must be one of ['none', 'mock', 'openai'].")
+        if self.app_env == "production" and not self.api_auth_token:
+            raise ValueError("API_AUTH_TOKEN is required when APP_ENV=production.")
+        if self.embed_provider == "openai" and not self.openai_api_key:
+            raise ValueError("OPENAI_API_KEY is required when EMBED_PROVIDER=openai.")
+        if self.llm_provider == "openai" and not self.openai_api_key:
+            raise ValueError("OPENAI_API_KEY is required when LLM_PROVIDER=openai.")
+        if self.reranker_provider == "openai" and not self.openai_api_key:
+            raise ValueError("OPENAI_API_KEY is required when RERANKER_PROVIDER=openai.")
+        return self
+
+    @property
+    def root_dir(self) -> Path:
+        return Path(__file__).resolve().parents[4]
+
+    @property
+    def effective_database_url(self) -> str:
+        if self.database_url:
+            return self.database_url
+        return f"sqlite:///{self.root_dir / 'data' / 'app.db'}"
+
+    @property
+    def effective_eval_dataset_dir(self) -> Path:
+        if self.eval_dataset_dir:
+            return self.eval_dataset_dir
+        return self.root_dir / "evals" / "datasets"
+
+    @property
+    def data_dir(self) -> Path:
+        return self.root_dir / "data"
+
+    @property
+    def uploads_dir(self) -> Path:
+        return self.data_dir / "uploads"

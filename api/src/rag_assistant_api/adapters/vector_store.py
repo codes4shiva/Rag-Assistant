@@ -1,0 +1,174 @@
+from __future__ import annotations
+
+from dataclasses import dataclass
+from datetime import date
+import re
+
+from qdrant_client import QdrantClient
+from qdrant_client.http.models import Distance, FieldCondition, Filter, MatchAny, MatchValue, PointStruct, Range, VectorParams
+
+from rag_assistant_api.core.config import Settings
+
+
+@dataclass
+class RetrievedChunk:
+    chunk_id: str
+    document_id: str
+    title: str
+    source_uri: str
+    category: str | None
+    document_date: date | None
+    excerpt: str
+    score: float
+    dense_score: float
+    lexical_score: float
+    final_score: float
+    chunk_index: int
+
+
+class QdrantVectorStore:
+    def __init__(self, settings: Settings, dimensions: int) -> None:
+        self.settings = settings
+        self.client = QdrantClient(location=settings.qdrant_location) if settings.qdrant_location else QdrantClient(url=settings.qdrant_url)
+        self.collection_name = settings.qdrant_collection
+        self.dimensions = dimensions
+        self.ensure_collection()
+
+    def ensure_collection(self) -> None:
+        collections = {item.name for item in self.client.get_collections().collections}
+        if self.collection_name not in collections:
+            self.client.create_collection(
+                collection_name=self.collection_name,
+                vectors_config=VectorParams(size=self.dimensions, distance=Distance.COSINE),
+            )
+            self._ensure_payload_indexes()
+            return
+        self._validate_collection_schema()
+        self._ensure_payload_indexes()
+
+    def _validate_collection_schema(self) -> None:
+        info = self.client.get_collection(self.collection_name)
+        vectors = info.config.params.vectors
+        vector_size = getattr(vectors, "size", None)
+        distance = getattr(vectors, "distance", None)
+        if isinstance(vectors, dict):
+            vector_size = next((getattr(item, "size", None) for item in vectors.values()), None)
+            distance = next((getattr(item, "distance", None) for item in vectors.values()), None)
+        if vector_size != self.dimensions:
+            raise RuntimeError(
+                f"Qdrant collection '{self.collection_name}' has vector size {vector_size}, "
+                f"but the configured embedding provider produces {self.dimensions}. "
+                "Use a new QDRANT_COLLECTION or reindex the collection."
+            )
+        if distance and str(distance).lower().split(".")[-1] != "cosine":
+            raise RuntimeError(
+                f"Qdrant collection '{self.collection_name}' uses distance {distance}; expected COSINE."
+            )
+
+    def _ensure_payload_indexes(self) -> None:
+        # Qdrant's in-memory mode used by tests may not support every index path; indexing is an optimization.
+        for field_name, schema in {
+            "document_id": "keyword",
+            "category": "keyword",
+            "document_timestamp": "integer",
+        }.items():
+            try:
+                self.client.create_payload_index(
+                    collection_name=self.collection_name,
+                    field_name=field_name,
+                    field_schema=schema,
+                )
+            except Exception:
+                pass
+
+    def upsert_chunks(self, points: list[PointStruct]) -> None:
+        if points:
+            self.client.upsert(collection_name=self.collection_name, points=points)
+
+    def delete_document(self, document_id: str) -> None:
+        filter_ = Filter(must=[FieldCondition(key="document_id", match=MatchValue(value=document_id))])
+        self.client.delete(collection_name=self.collection_name, points_selector=filter_)
+
+    def search(
+        self,
+        query_vector: list[float],
+        top_k: int,
+        document_ids: list[str] | None = None,
+        category: str | None = None,
+        date_from_timestamp: int | None = None,
+        date_to_timestamp: int | None = None,
+        query_text: str = "",
+        retrieval_mode: str = "hybrid",
+        alpha: float = 0.75,
+    ) -> list[RetrievedChunk]:
+        filter_ = self._build_filter(document_ids, category, date_from_timestamp, date_to_timestamp)
+        response = self.client.query_points(
+            collection_name=self.collection_name,
+            query=query_vector,
+            limit=top_k * 4 if retrieval_mode == "hybrid" else top_k,
+            query_filter=filter_,
+            with_payload=True,
+        )
+        hits = response.points
+        results: list[RetrievedChunk] = []
+        for hit in hits:
+            payload = hit.payload or {}
+            document_date = date.fromisoformat(payload["document_date"]) if payload.get("document_date") else None
+            dense_score = float(hit.score)
+            dense_for_final = max(0.0, min(1.0, dense_score))
+            results.append(
+                RetrievedChunk(
+                    chunk_id=str(hit.id),
+                    document_id=str(payload.get("document_id", "")),
+                    title=str(payload.get("title", "")),
+                    source_uri=str(payload.get("source_uri", "")),
+                    category=payload.get("category"),
+                    document_date=document_date,
+                    excerpt=str(payload.get("chunk_text", "")),
+                    score=dense_for_final,
+                    dense_score=dense_score,
+                    lexical_score=0.0,
+                    final_score=dense_for_final,
+                    chunk_index=int(payload.get("chunk_index", 0)),
+                )
+            )
+        return sorted(results, key=lambda item: item.final_score, reverse=True)[:top_k]
+
+    def healthcheck(self) -> bool:
+        return bool(self.client.get_collections().collections or True)
+
+    def close(self) -> None:
+        self.client.close()
+
+    def _build_filter(
+        self,
+        document_ids: list[str] | None,
+        category: str | None,
+        date_from_timestamp: int | None,
+        date_to_timestamp: int | None,
+    ) -> Filter | None:
+        must = []
+        if document_ids:
+            must.append(FieldCondition(key="document_id", match=MatchAny(any=document_ids)))
+        if category:
+            must.append(FieldCondition(key="category", match=MatchValue(value=category)))
+        if date_from_timestamp is not None or date_to_timestamp is not None:
+            must.append(
+                FieldCondition(
+                    key="document_timestamp",
+                    range=Range(gte=date_from_timestamp, lte=date_to_timestamp),
+                )
+            )
+        return Filter(must=must) if must else None
+
+
+def _tokenize(text: str) -> list[str]:
+    return [token for token in re.findall(r"[a-zA-Z0-9]{3,}", text.lower()) if token]
+
+
+def _lexical_score(query_terms: list[str], chunk_terms: list[str]) -> float:
+    if not query_terms or not chunk_terms:
+        return 0.0
+    query_set = set(query_terms)
+    chunk_set = set(chunk_terms)
+    return len(query_set & chunk_set) / len(query_set)
