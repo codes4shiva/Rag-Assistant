@@ -1,7 +1,6 @@
 # RAG Assistant
 
-[![CI](https://github.com/javsanesq/rag-assistant/actions/workflows/ci.yml/badge.svg)](https://github.com/javsanesq/rag-assistant/actions/workflows/ci.yml)
-[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+
 
 Production-grade RAG assistant built with FastAPI, Qdrant, durable SQL-backed jobs, offline evaluation, visible citations, and a polished operations UI.
 
